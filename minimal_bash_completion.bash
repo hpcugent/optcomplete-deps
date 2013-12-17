@@ -324,3 +324,335 @@ _get_comp_words_by_ref()
 }
 
 fi # end _get_comp_words_by_ref conditional
+
+type _filedir >& /dev/null
+if [ $? -ne 0 ]
+then # begin _filedir conditional
+
+# This function turns on "-o filenames" behavior dynamically. It is present
+# for bash < 4 reasons. See http://bugs.debian.org/272660#64 for info about
+# the bash < 4 compgen hack.
+_compopt_o_filenames()
+{
+    # We test for compopt availability first because directly invoking it on
+    # bash < 4 at this point may cause terminal echo to be turned off for some
+    # reason, see https://bugzilla.redhat.com/653669 for more info.
+    type compopt &>/dev/null && compopt -o filenames 2>/dev/null || \
+        compgen -f /non-existing-dir/ >/dev/null
+}
+
+# Perform tilde (~) completion
+# @return  True (0) if completion needs further processing, 
+#          False (> 0) if tilde is followed by a valid username, completions
+#          are put in COMPREPLY and no further processing is necessary.
+_tilde() {
+    local result=0
+    # Does $1 start with tilde (~) and doesn't contain slash (/)?
+    if [[ ${1:0:1} == "~" && $1 == ${1//\/} ]]; then
+        _compopt_o_filenames
+        # Try generate username completions
+        COMPREPLY=( $( compgen -P '~' -u "${1#\~}" ) )
+        result=${#COMPREPLY[@]}
+    fi
+    return $result
+}
+
+# This function performs file and directory completion. It's better than
+# simply using 'compgen -f', because it honours spaces in filenames.
+# @param $1  If `-d', complete only on directories.  Otherwise filter/pick only
+#            completions with `.$1' and the uppercase version of it as file
+#            extension.
+#
+_filedir()
+{
+    local i IFS=$'\n' xspec
+
+    _tilde "$cur" || return 0
+
+    local -a toks
+    local quoted tmp
+
+    _quote_readline_by_ref "$cur" quoted
+    toks=( ${toks[@]-} $(
+        compgen -d -- "$quoted" | {
+            while read -r tmp; do
+                # TODO: I have removed a "[ -n $tmp ] &&" before 'printf ..',
+                #       and everything works again. If this bug suddenly
+                #       appears again (i.e. "cd /b<TAB>" becomes "cd /"),
+                #       remember to check for other similar conditionals (here
+                #       and _filedir_xspec()). --David
+                printf '%s\n' $tmp
+            done
+        }
+    ))
+
+    if [[ "$1" != -d ]]; then
+        # Munge xspec to contain uppercase version too
+        [[ ${BASH_VERSINFO[0]} -ge 4 ]] && \
+            xspec=${1:+"!*.@($1|${1^^})"} || \
+            xspec=${1:+"!*.@($1|$(printf %s $1 | tr '[:lower:]' '[:upper:]'))"}
+        toks=( ${toks[@]-} $( compgen -f -X "$xspec" -- $quoted) )
+    fi
+    [ ${#toks[@]} -ne 0 ] && _compopt_o_filenames
+
+    COMPREPLY=( "${COMPREPLY[@]}" "${toks[@]}" )
+} # _filedir()
+
+fi # end _filedir conditional
+
+type _known_hosts >& /dev/null
+if [ $? -ne 0 ]
+then # begin _known_hosts conditional
+
+# NOTE: Using this function as a helper function is deprecated.  Use
+#       `_known_hosts_real' instead.
+_known_hosts()
+{
+    local options
+    COMPREPLY=()
+
+    # NOTE: Using `_known_hosts' as a helper function and passing options
+    #       to `_known_hosts' is deprecated: Use `_known_hosts_real' instead.
+    [[ "$1" == -a || "$2" == -a ]] && options=-a
+    [[ "$1" == -c || "$2" == -c ]] && options="$options -c"
+    _known_hosts_real $options "$(_get_cword :)"
+} # _known_hosts()
+
+# Expand variable starting with tilde (~)
+# We want to expand ~foo/... to /home/foo/... to avoid problems when
+# word-to-complete starting with a tilde is fed to commands and ending up
+# quoted instead of expanded.
+# Only the first portion of the variable from the tilde up to the first slash
+# (~../) is expanded.  The remainder of the variable, containing for example
+# a dollar sign variable ($) or asterisk (*) is not expanded.
+# Example usage:
+#
+#    $ v="~"; __expand_tilde_by_ref v; echo "$v"
+#
+# Example output:
+#
+#       v                  output
+#    --------         ----------------
+#    ~                /home/user
+#    ~foo/bar         /home/foo/bar
+#    ~foo/$HOME       /home/foo/$HOME
+#    ~foo/a  b        /home/foo/a  b
+#    ~foo/*           /home/foo/*
+#  
+# @param $1  Name of variable (not the value of the variable) to expand
+__expand_tilde_by_ref() {
+    # Does $1 start with tilde (~)?
+    if [ "${!1:0:1}" = "~" ]; then
+        # Does $1 contain slash (/)?
+        if [ "${!1}" != "${!1//\/}" ]; then
+            # Yes, $1 contains slash;
+            # 1: Remove * including and after first slash (/), i.e. "~a/b"
+            #    becomes "~a".  Double quotes allow eval.
+            # 2: Remove * before the first slash (/), i.e. "~a/b"
+            #    becomes "b".  Single quotes prevent eval.
+            #       +-----1----+ +---2----+
+            eval $1="${!1/%\/*}"/'${!1#*/}'
+        else 
+            # No, $1 doesn't contain slash
+            eval $1="${!1}"
+        fi
+    fi
+} # __expand_tilde_by_ref()
+
+# If the word-to-complete contains a colon (:), left-trim COMPREPLY items with
+# word-to-complete.
+# On bash-3, and bash-4 with a colon in COMP_WORDBREAKS, words containing
+# colons are always completed as entire words if the word to complete contains
+# a colon.  This function fixes this, by removing the colon-containing-prefix
+# from COMPREPLY items.
+# The preferred solution is to remove the colon (:) from COMP_WORDBREAKS in
+# your .bashrc:
+#
+#    # Remove colon (:) from list of word completion separators
+#    COMP_WORDBREAKS=${COMP_WORDBREAKS//:}
+#
+# See also: Bash FAQ - E13) Why does filename completion misbehave if a colon
+# appears in the filename? - http://tiswww.case.edu/php/chet/bash/FAQ
+# @param $1 current word to complete (cur)
+# @modifies global array $COMPREPLY
+#
+__ltrim_colon_completions() {
+    # If word-to-complete contains a colon,
+    # and bash-version < 4,
+    # or bash-version >= 4 and COMP_WORDBREAKS contains a colon
+    if [[
+        "$1" == *:* && (
+            ${BASH_VERSINFO[0]} -lt 4 || 
+            (${BASH_VERSINFO[0]} -ge 4 && "$COMP_WORDBREAKS" == *:*) 
+        )
+    ]]; then
+        # Remove colon-word prefix from COMPREPLY items
+        local colon_word=${1%${1##*:}}
+        local i=${#COMPREPLY[*]}
+        while [ $((--i)) -ge 0 ]; do
+            COMPREPLY[$i]=${COMPREPLY[$i]#"$colon_word"}
+        done
+    fi
+} # __ltrim_colon_completions()
+
+# Helper function for completing _known_hosts.
+# This function performs host completion based on ssh's config and known_hosts
+# files, as well as hostnames reported by avahi-browse if
+# COMP_KNOWN_HOSTS_WITH_AVAHI is set to a non-empty value.  Also hosts from
+# HOSTFILE (compgen -A hostname) are added, unless
+# COMP_KNOWN_HOSTS_WITH_HOSTFILE is set to an empty value.
+# Usage: _known_hosts_real [OPTIONS] CWORD
+# Options:  -a             Use aliases
+#           -c             Use `:' suffix
+#           -F configfile  Use `configfile' for configuration settings
+#           -p PREFIX      Use PREFIX
+# Return: Completions, starting with CWORD, are added to COMPREPLY[]
+_known_hosts_real()
+{
+    local configfile flag prefix
+    local cur curd awkcur user suffix aliases i host
+    local -a kh khd config
+
+    local OPTIND=1
+    while getopts "acF:p:" flag "$@"; do
+        case $flag in
+            a) aliases='yes' ;;
+            c) suffix=':' ;;
+            F) configfile=$OPTARG ;;
+            p) prefix=$OPTARG ;;
+        esac
+    done
+    [ $# -lt $OPTIND ] && echo "error: $FUNCNAME: missing mandatory argument CWORD"
+    cur=${!OPTIND}; let "OPTIND += 1"
+    [ $# -ge $OPTIND ] && echo "error: $FUNCNAME("$@"): unprocessed arguments:"\
+    $(while [ $# -ge $OPTIND ]; do printf '%s\n' ${!OPTIND}; shift; done)
+
+    [[ $cur == *@* ]] && user=${cur%@*}@ && cur=${cur#*@}
+    kh=()
+
+    # ssh config files
+    if [ -n "$configfile" ]; then
+        [ -r "$configfile" ] &&
+        config=( "${config[@]}" "$configfile" )
+    else
+        for i in /etc/ssh/ssh_config "${HOME}/.ssh/config" \
+            "${HOME}/.ssh2/config"; do
+            [ -r $i ] && config=( "${config[@]}" "$i" )
+        done
+    fi
+
+    # Known hosts files from configs
+    if [ ${#config[@]} -gt 0 ]; then
+        local OIFS=$IFS IFS=$'\n'
+        local -a tmpkh
+        # expand paths (if present) to global and user known hosts files
+        # TODO(?): try to make known hosts files with more than one consecutive
+        #          spaces in their name work (watch out for ~ expansion
+        #          breakage! Alioth#311595)
+        tmpkh=( $( awk 'sub("^[ \t]*([Gg][Ll][Oo][Bb][Aa][Ll]|[Uu][Ss][Ee][Rr])[Kk][Nn][Oo][Ww][Nn][Hh][Oo][Ss][Tt][Ss][Ff][Ii][Ll][Ee][ \t]+", "") { print $0 }' "${config[@]}" | sort -u ) )
+        for i in "${tmpkh[@]}"; do
+            # Remove possible quotes
+            i=${i//\"}
+            # Eval/expand possible `~' or `~user'
+            __expand_tilde_by_ref i
+            [ -r "$i" ] && kh=( "${kh[@]}" "$i" )
+        done
+        IFS=$OIFS
+    fi
+
+    if [ -z "$configfile" ]; then
+        # Global and user known_hosts files
+        for i in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 \
+            /etc/known_hosts /etc/known_hosts2 ~/.ssh/known_hosts \
+            ~/.ssh/known_hosts2; do
+            [ -r $i ] && kh=( "${kh[@]}" $i )
+        done
+        for i in /etc/ssh2/knownhosts ~/.ssh2/hostkeys; do
+            [ -d $i ] && khd=( "${khd[@]}" $i/*pub )
+        done
+    fi
+
+    # If we have known_hosts files to use
+    if [[ ${#kh[@]} -gt 0 || ${#khd[@]} -gt 0 ]]; then
+        # Escape slashes and dots in paths for awk
+        awkcur=${cur//\//\\\/}
+        awkcur=${awkcur//\./\\\.}
+        curd=$awkcur
+
+        if [[ "$awkcur" == [0-9]*[.:]* ]]; then
+            # Digits followed by a dot or a colon - just search for that
+            awkcur="^$awkcur[.:]*"
+        elif [[ "$awkcur" == [0-9]* ]]; then
+            # Digits followed by no dot or colon - search for digits followed
+            # by a dot or a colon
+            awkcur="^$awkcur.*[.:]"
+        elif [ -z "$awkcur" ]; then
+            # A blank - search for a dot, a colon, or an alpha character
+            awkcur="[a-z.:]"
+        else
+            awkcur="^$awkcur"
+        fi
+
+        if [ ${#kh[@]} -gt 0 ]; then
+            # FS needs to look for a comma separated list
+            COMPREPLY=( "${COMPREPLY[@]}" $( awk 'BEGIN {FS=","}
+            /^\s*[^|\#]/ {for (i=1; i<=2; ++i) { \
+            sub(" .*$", "", $i); \
+            sub("^\\[", "", $i); sub("\\](:[0-9]+)?$", "", $i); \
+            if ($i ~ /'"$awkcur"'/) {print $i} \
+            }}' "${kh[@]}" 2>/dev/null ) )
+        fi
+        if [ ${#khd[@]} -gt 0 ]; then
+            # Needs to look for files called
+            # .../.ssh2/key_22_<hostname>.pub
+            # dont fork any processes, because in a cluster environment,
+            # there can be hundreds of hostkeys
+            for i in "${khd[@]}" ; do
+                if [[ "$i" == *key_22_$curd*.pub && -r "$i" ]]; then
+                    host=${i/#*key_22_/}
+                    host=${host/%.pub/}
+                    COMPREPLY=( "${COMPREPLY[@]}" $host )
+                fi
+            done
+        fi
+
+        # apply suffix and prefix
+        for (( i=0; i < ${#COMPREPLY[@]}; i++ )); do
+            COMPREPLY[i]=$prefix$user${COMPREPLY[i]}$suffix
+        done
+    fi
+
+    # append any available aliases from config files
+    if [[ ${#config[@]} -gt 0 && -n "$aliases" ]]; then
+        local hosts=$( sed -ne 's/^[ \t]*[Hh][Oo][Ss][Tt]\([Nn][Aa][Mm][Ee]\)\{0,1\}['"$'\t '"']\{1,\}\([^#*?]*\)\(#.*\)\{0,1\}$/\2/p' "${config[@]}" )
+        COMPREPLY=( "${COMPREPLY[@]}" $( compgen  -P "$prefix$user" \
+            -S "$suffix" -W "$hosts" -- "$cur" ) )
+    fi
+
+    # Add hosts reported by avahi-browse, if desired and it's available.
+    if [[ ${COMP_KNOWN_HOSTS_WITH_AVAHI:-} ]] && \
+        type avahi-browse &>/dev/null; then
+        # The original call to avahi-browse also had "-k", to avoid lookups
+        # into avahi's services DB. We don't need the name of the service, and
+        # if it contains ";", it may mistify the result. But on Gentoo (at
+        # least), -k wasn't available (even if mentioned in the manpage) some
+        # time ago, so...
+        COMPREPLY=( "${COMPREPLY[@]}" $( \
+            compgen -P "$prefix$user" -S "$suffix" -W \
+            "$( avahi-browse -cpr _workstation._tcp 2>/dev/null | \
+                 awk -F';' '/^=/ { print $7 }' | sort -u )" -- "$cur" ) )
+    fi
+
+    # Add results of normal hostname completion, unless
+    # `COMP_KNOWN_HOSTS_WITH_HOSTFILE' is set to an empty value.
+    if [ -n "${COMP_KNOWN_HOSTS_WITH_HOSTFILE-1}" ]; then
+        COMPREPLY=( "${COMPREPLY[@]}"
+            $( compgen -A hostname -P "$prefix$user" -S "$suffix" -- "$cur" ) )
+    fi
+
+    __ltrim_colon_completions "$prefix$user$cur"
+
+    return 0
+} # _known_hosts_real()
+
+fi # end _known_hosts conditional
